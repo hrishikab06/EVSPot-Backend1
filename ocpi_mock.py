@@ -1,0 +1,135 @@
+from fastapi import APIRouter
+from database import get_connection
+
+router = APIRouter(prefix="/ocpi")
+
+
+@router.get("/versions")
+def get_versions():
+    return {
+        "data": [
+            {
+                "version": "2.2.1",
+                "url": "http://16.16.198.218:8000/ocpi/2.2.1"
+            }
+        ]
+    }
+
+
+@router.get("/2.2.1/locations")
+def get_locations():
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            SELECT
+                id,
+                name,
+                address,
+                city,
+                state,
+                postal_code,
+                latitude,
+                longitude,
+                operator_name,
+                access_type,
+                open_24_7,
+                opening_hours
+            FROM charging_stations
+            ORDER BY id
+            """
+        )
+
+        stations = cursor.fetchall()
+
+        locations = []
+
+        for station in stations:
+
+            (
+                station_id,
+                name,
+                address,
+                city,
+                state,
+                postal_code,
+                latitude,
+                longitude,
+                operator_name,
+                access_type,
+                open_24_7,
+                opening_hours
+            ) = station
+
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    connector_type,
+                    power_kw,
+                    status
+                FROM chargers
+                WHERE station_id = %s
+                ORDER BY id
+                """,
+                (station_id,)
+            )
+
+            chargers = cursor.fetchall()
+
+            evses = []
+
+            for charger in chargers:
+
+                charger_id, connector_type, power_kw, status = charger
+
+                evses.append({
+                    "uid": f"EVSE-{charger_id}",
+                    "evse_id": f"EVSPOT*{station_id}*{charger_id}",
+                    "status": status.upper(),
+                    "connectors": [
+                        {
+                            "id": f"CONN-{charger_id}",
+                            "standard": connector_type,
+                            "format": "SOCKET",
+                            "power_type": "DC",
+                            "max_voltage": 400,
+                            "max_amperage": 32,
+                            "max_electric_power": int(float(power_kw) * 1000)
+                        }
+                    ]
+                })
+
+            location = {
+                "country_code": "IN",
+                "party_id": "EVS",
+                "id": f"STATION-{station_id}",
+                "publish": True,
+                "name": name,
+                "address": address,
+                "city": city,
+                "postal_code": postal_code,
+                "state": state,
+                "country": "IND",
+                "coordinates": {
+                    "latitude": str(latitude),
+                    "longitude": str(longitude)
+                },
+                "operator": {
+                    "name": operator_name or "EVSpot"
+                },
+                "evses": evses
+            }
+
+            locations.append(location)
+
+        return {
+            "data": locations
+        }
+
+    finally:
+        cursor.close()
+        conn.close()
