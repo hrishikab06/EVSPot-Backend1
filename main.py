@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime, timedelta, timezone
 from ocpi_mock import router as ocpi_router
 import bcrypt
@@ -307,73 +307,49 @@ def plan_trip(data: PlanTripRequest):
         })
 
     # ---------------------------------------------------------
-    # No valid one-stop solution
+    # Choose fastest valid one-stop station
     # ---------------------------------------------------------
 
-        if not evaluated_stations:
-          return {
+    if not evaluated_stations:
+        # Direct route info if no stops found
+        direct_route = get_route(
+            data.current_lat,
+            data.current_lng,
+            data.destination_lat,
+            data.destination_lng
+        )
+        if direct_route is None:
+             raise HTTPException(status_code=404, detail="No route found to destination")
+
+        return {
             "one_stop_possible": False,
             "message": (
                 "No single charging station can complete "
                 "this trip with one charging stop."
             ),
-
-            "total_distance_km": round(
-                direct_route["distance_km"],
-                2
-            ),
-
-            "drive_time_minutes": round(
-                direct_route["duration_minutes"],
-                2
-            ),
-
+            "total_distance_km": round(direct_route["distance_km"], 2),
+            "drive_time_minutes": round(direct_route["duration_minutes"], 2),
             "recommended_station": None,
-
             "arrival_soc_percent": None,
-
             "target_soc_percent": target_soc,
-
             "charging_time_minutes": None,
-
             "charging_cost_inr": 0.0,
-
-            "total_trip_time_minutes": round(
-                direct_route["duration_minutes"],
-                2
-            ),
-
+            "total_trip_time_minutes": round(direct_route["duration_minutes"], 2),
             "route_plan": [
                 {
                     "type": "start",
                     "name": "Your Location",
-                    "distance_km": round(
-                        direct_route["distance_km"],
-                        2
-                    ),
-                    "drive_time_minutes": round(
-                        direct_route["duration_minutes"],
-                        2
-                    )
+                    "distance_km": round(direct_route["distance_km"], 2),
+                    "drive_time_minutes": round(direct_route["duration_minutes"], 2)
                 },
                 {
                     "type": "destination",
                     "name": "Destination",
-                    "distance_km": round(
-                        direct_route["distance_km"],
-                        2
-                    ),
-                    "drive_time_minutes": round(
-                        direct_route["duration_minutes"],
-                        2
-                    )
+                    "distance_km": round(direct_route["distance_km"], 2),
+                    "drive_time_minutes": round(direct_route["duration_minutes"], 2)
                 }
             ]
         }
-
-    # ---------------------------------------------------------
-    # Choose fastest valid one-stop station
-    # ---------------------------------------------------------
 
     best = min(
         evaluated_stations,
@@ -391,19 +367,9 @@ def plan_trip(data: PlanTripRequest):
 
     return {
         "one_stop_possible": True,
-
         "message": "One-stop charging plan found.",
-
-        "total_distance_km": round(
-            total_drive_distance,
-            2
-        ),
-
-        "drive_time_minutes": round(
-            total_drive_time,
-            2
-        ),
-
+        "total_distance_km": round(total_drive_distance, 2),
+        "drive_time_minutes": round(total_drive_time, 2),
         "recommended_station": {
             "id": station.id,
             "name": station.name,
@@ -411,58 +377,28 @@ def plan_trip(data: PlanTripRequest):
             "latitude": station.latitude,
             "longitude": station.longitude
         },
-
-        "arrival_soc_percent": round(
-            arrival_soc,
-            2
-        ),
-
+        "arrival_soc_percent": round(arrival_soc, 2),
         "target_soc_percent": target_soc,
-
-        "charging_time_minutes": round(
-            charging_time,
-            2
-        ),
-
+        "charging_time_minutes": round(charging_time, 2),
         "charging_cost_inr": 0.0,
-
-        "total_trip_time_minutes": round(
-            total_trip_time,
-            2
-        ),
-
+        "total_trip_time_minutes": round(total_trip_time, 2),
         "route_plan": [
             {
                 "type": "start",
                 "name": "Your Location",
-                "distance_km": round(
-                    route_to_station["distance_km"],
-                    2
-                ),
-                "drive_time_minutes": round(
-                    route_to_station["duration_minutes"],
-                    2
-                )
+                "distance_km": round(route_to_station["distance_km"], 2),
+                "drive_time_minutes": round(route_to_station["duration_minutes"], 2)
             },
             {
                 "type": "charging",
                 "name": station.name,
-                "charging_time_minutes": round(
-                    charging_time,
-                    2
-                )
+                "charging_time_minutes": round(charging_time, 2)
             },
             {
                 "type": "destination",
                 "name": "Destination",
-                "distance_km": round(
-                    route_from_station["distance_km"],
-                    2
-                ),
-                "drive_time_minutes": round(
-                    route_from_station["duration_minutes"],
-                    2
-                )
+                "distance_km": round(route_from_station["distance_km"], 2),
+                "drive_time_minutes": round(route_from_station["duration_minutes"], 2)
             }
         ]
     }
@@ -1193,5 +1129,83 @@ def check_charger_availability(
 
     finally:
 
+        cursor.close()
+        conn.close()
+
+# =========================================================
+# GET USER BOOKINGS
+# =========================================================
+
+@app.get("/bookings")
+def get_user_bookings(user_id: int):
+    print(f"DEBUG: Fetching bookings for user_id: {user_id}")
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+        # Expire old bookings before fetching
+        expire_old_bookings(cursor)
+        conn.commit()
+
+        cursor.execute(
+            """
+            SELECT
+                b.id,
+                b.user_id,
+                b.charger_id,
+                b.start_time,
+                b.end_time,
+                b.status,
+                b.estimated_cost_inr,
+                b.created_at,
+                b.arrived_at,
+                s.name as station_name,
+                s.address as station_address,
+                c.connector_type,
+                c.power_kw
+            FROM bookings b
+            JOIN chargers c ON b.charger_id = c.id
+            JOIN charging_stations s ON c.station_id = s.id
+            WHERE b.user_id = %s
+            ORDER BY b.start_time DESC
+            """,
+            (user_id,)
+        )
+
+        rows = cursor.fetchall()
+        print(f"DEBUG: Found {len(rows)} bookings for user_id {user_id}")
+
+        bookings = []
+        for row in rows:
+            print(f"DEBUG: Booking ID {row[0]}, status {row[5]}")
+            # Power KW might be null or float
+            power = float(row[12]) if row[12] is not None else None
+
+            bookings.append({
+                "id": row[0],
+                "user_id": row[1],
+                "charger_id": row[2],
+                "start_time": row[3].isoformat() if hasattr(row[3], 'isoformat') else str(row[3]),
+                "end_time": row[4].isoformat() if hasattr(row[4], 'isoformat') else str(row[4]),
+                "status": row[5],
+                "estimated_cost_inr": int(row[6]) if row[6] is not None else None,
+                "created_at": row[7].isoformat() if hasattr(row[7], 'isoformat') else str(row[7]),
+                "arrived_at": row[8].isoformat() if (row[8] and hasattr(row[8], 'isoformat')) else str(row[8]) if row[8] else None,
+                "station_name": row[9],
+                "station_address": row[10],
+                "connector_type": row[11],
+                "power_kw": power
+            })
+
+        return bookings
+
+    except Exception as e:
+        print("Fetch bookings error:", e)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to fetch bookings"
+        )
+
+    finally:
         cursor.close()
         conn.close()
